@@ -1,0 +1,34 @@
+networks:
+  bridge:
+    driver: bridge
+volumes:
+services:
+  redis:
+    image: redis:7-alpine 
+    ports:
+      - "6379:6379"
+    network:
+      - bridge
+    volumes:
+      - redis_data:/data 
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+  crbn-discord-bot:
+    container_name: crbn-discord-bot
+    image: crbn-discord-bot
+    pull_policy: never
+    ports:
+      - "3000:3000"
+    networks:
+      bridge
+    volumes:
+    env_file: .env.local
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped 
