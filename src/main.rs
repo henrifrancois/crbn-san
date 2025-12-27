@@ -1,72 +1,151 @@
+#![warn(clippy::str_to_string)]
+#[allow(dead_code)]
+
 mod commands;
 
-use std::env;
-use dotenv::from_filename;
+use poise::serenity_prelude as serenity;
+use std::{
+    collections::HashMap,
+    env::var,
+    sync::{Arc, Mutex},
+    sync::atomic::{AtomicU32, Ordering},
+    time::Duration,
+};
 
-use serenity::async_trait;
-use serenity::builder::{CreateInteractionResponse, CreateInteractionResponseMessage};
-use serenity::model::application::Interaction;
-use serenity::model::gateway::Ready;
-use serenity::model::id::GuildId;
-use serenity::prelude::*;
+// Types used by all command functions
+type Error = Box<dyn std::error::Error + Send + Sync>;
+type Context<'a> = poise::Context<'a, Data, Error>;
 
-struct Handler;
+// Custom user data passed to all command functions
+pub struct Data {
+    votes: Mutex<HashMap<String, u32>>,
+    poise_mentions: AtomicU32,
+}
 
-#[async_trait]
-impl EventHandler for Handler {
-    async fn interaction_create(&self, ctx: Context, interaction: Interaction) {
-        if let Interaction::Command(command) = interaction {
-            println!("Received command interaction: {command:#?}");
-
-            let content = match command.data.name.as_str() {
-                "id" => Some(commands::id::run(&command.data.options())),
-                _ => Some("not implemented :(".to_string()),
-            };
-
-            if let Some(content) = content {
-                let data = CreateInteractionResponseMessage::new().content(content);
-                let builder = CreateInteractionResponse::Message(data);
-                if let Err(why) = command.create_response(&ctx.http, builder).await {
-                    println!("Cannot respond to slash command: {why}");
-                }
+async fn on_error(error: poise::FrameworkError<'_, Data, Error>) {
+    // This is our custom error handler
+    // They are many errors that can occur, so we only handle the ones we want to customize
+    // and forward the rest to the default handler
+    match error {
+        poise::FrameworkError::Setup { error, .. } => panic!("Failed to start bot: {:?}", error),
+        poise::FrameworkError::Command { error, ctx, .. } => {
+            println!("Error in command `{}`: {:?}", ctx.command().name, error,);
+        }
+        error => {
+            if let Err(e) = poise::builtins::on_error(error).await {
+                println!("Error while handling error: {}", e)
             }
         }
     }
+}
 
-    async fn ready(&self, ctx: Context, ready: Ready) {
-        println!("{} is connected!", ready.user.name);
-
-        let guild_id = GuildId::new(
-            env::var("TTS_GUILD_ID_TESTING")
-                .expect("Expected GUILD_ID in environment")
-                .parse()
-                .expect("GUILD_ID must be an integer"),
-        );
-
-        let commands = guild_id
-            .set_commands(&ctx.http, vec![
-                commands::id::register(),
-                commands::welcome::register(),
-            ])
-            .await;
-
-        println!("I now have the following guild slash commands: {commands:#?}");
+async fn event_handler(
+    ctx: &serenity::Context,
+    event: &serenity::FullEvent,
+    _framework: poise::FrameworkContext<'_, Data, Error>,
+    data: &Data,
+) -> Result<(), Error> {
+    match event {
+        serenity::FullEvent::Ready { data_about_bot, .. } => {
+            println!("Logged in as {}", data_about_bot.user.name);
+        }
+        serenity::FullEvent::Message { new_message } => {
+            if new_message.content.to_lowercase().contains("poise")
+                && new_message.author.id != ctx.cache.current_user().id
+            {
+                let old_mentions = data.poise_mentions.fetch_add(1, Ordering::SeqCst);
+                new_message
+                    .reply(
+                        ctx,
+                        format!("Poise has been mentioned {} times", old_mentions + 1),
+                    )
+                    .await?;
+            }
+        }
+        _ => {}
     }
+    Ok(())
 }
 
 #[tokio::main]
 async fn main() {
-    from_filename(".env.local").ok();
+    tracing_subscriber::fmt::init();
 
-    let token = env::var("DISCORD_TOKEN").expect("Expected a token in the environment");
-    
-    let intents = GatewayIntents::GUILD_MESSAGES
-        | GatewayIntents::DIRECT_MESSAGES
-        | GatewayIntents::MESSAGE_CONTENT;
-    
-    let mut client = Client::builder(&token, intents).event_handler(Handler).await.expect("Error creating client");
+    // FrameworkOptions contains all of poise's configuration option in one struct
+    // Every option can be omitted to use its default value
+    let options = poise::FrameworkOptions {
+        commands: vec![commands::help::help(), commands::vote::vote(), commands::vote::getvotes()],
+        prefix_options: poise::PrefixFrameworkOptions {
+            prefix: Some("~".into()),
+            edit_tracker: Some(Arc::new(poise::EditTracker::for_timespan(
+                Duration::from_secs(3600),
+            ))),
+            additional_prefixes: vec![
+                poise::Prefix::Literal("hey bot,"),
+                poise::Prefix::Literal("hey bot"),
+            ],
+            ..Default::default()
+        },
+        // The global error handler for all error cases that may occur
+        on_error: |error| Box::pin(on_error(error)),
+        // This code is run before every command
+        pre_command: |ctx| {
+            Box::pin(async move {
+                println!("Executing command {}...", ctx.command().qualified_name);
+            })
+        },
+        // This code is run after a command if it was successful (returned Ok)
+        post_command: |ctx| {
+            Box::pin(async move {
+                println!("Executed command {}!", ctx.command().qualified_name);
+            })
+        },
+        // Every command invocation must pass this check to continue execution
+        command_check: Some(|ctx| {
+            Box::pin(async move {
+                if ctx.author().id == 123456789 {
+                    return Ok(false);
+                }
+                Ok(true)
+            })
+        }),
+        // Enforce command checks even for owners (enforced by default)
+        // Set to true to bypass checks, which is useful for testing
+        skip_checks_for_owners: false,
+        event_handler: |_ctx, event, _framework, _data| {
+            Box::pin(async move {
+                println!(
+                    "Got an event in event handler: {:?}",
+                    event.snake_case_name()
+                );
+                Ok(())
+            })
+        },
+        ..Default::default()
+    };
 
-    if let Err(why) = client.start().await {
-        println!("Client error: {why:?}");
-    }
+    let framework = poise::Framework::builder()
+        .setup(move |ctx, _ready, framework| {
+            Box::pin(async move {
+                println!("Logged in as {}", _ready.user.name);
+                poise::builtins::register_globally(ctx, &framework.options().commands).await?;
+                Ok(Data {
+                    votes: Mutex::new(HashMap::new()),
+                    poise_mentions: AtomicU32::new(0)
+                })
+            })
+        })
+        .options(options)
+        .build();
+
+    let token = var("DISCORD_TOKEN")
+        .expect("Missing `DISCORD_TOKEN` env var, see README for more information.");
+    let intents =
+        serenity::GatewayIntents::non_privileged() | serenity::GatewayIntents::MESSAGE_CONTENT;
+
+    let client = serenity::ClientBuilder::new(token, intents)
+        .framework(framework)
+        .await;
+
+    client.unwrap().start().await.unwrap()
 }
