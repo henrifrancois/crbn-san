@@ -4,6 +4,7 @@
 mod commands;
 
 use poise::serenity_prelude as serenity;
+use dotenv::from_filename;
 use std::{
     collections::HashMap,
     env::var,
@@ -71,6 +72,8 @@ async fn event_handler(
 async fn main() {
     tracing_subscriber::fmt::init();
 
+    from_filename(".env.local").ok();
+
     // FrameworkOptions contains all of poise's configuration option in one struct
     // Every option can be omitted to use its default value
     let options = poise::FrameworkOptions {
@@ -111,7 +114,7 @@ async fn main() {
         }),
         // Enforce command checks even for owners (enforced by default)
         // Set to true to bypass checks, which is useful for testing
-        skip_checks_for_owners: false,
+        skip_checks_for_owners: true,
         event_handler: |_ctx, event, _framework, _data| {
             Box::pin(async move {
                 println!(
